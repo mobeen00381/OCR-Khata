@@ -12,11 +12,14 @@ import type {
 
 const GLM_DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4";
 const QWEN_DEFAULT_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
-const GLM_PRIMARY_MODEL = "glm-4.6v";
-const GLM_FAST_MODEL = "glm-4.6v-flash";
+const GLM_FLASHX_MODEL = "glm-4.6v-flashx";
+const GLM_FLASH_MODEL = "glm-4.6v-flash";
+const GLM_DEEP_MODEL = "glm-4.6v";
 const QWEN_VISION_MODEL = "qwen-vl-plus";
 const MOCK_MODEL = "mock-fallback";
 const DEFAULT_TIMEOUT_MS = 30_000;
+const FLASH_429_RETRIES = 2;
+const FLASH_429_BACKOFF_MS = 1_500;
 
 const UNIT_VALUES: ProductUnit[] = ["length", "kg", "pcs"];
 
@@ -27,10 +30,10 @@ interface EngineConfig {
 }
 
 interface OcrConfig {
-  glmPrimary: EngineConfig | null;
-  glmFast: EngineConfig | null;
+  glmFlashX: EngineConfig | null;
+  glmFlash: EngineConfig | null;
+  glmDeep: EngineConfig | null;
   qwen: EngineConfig | null;
-  qwenEscalationModel: string;
   timeoutMs: number;
 }
 
@@ -38,6 +41,7 @@ export interface OcrAttempt {
   model: string;
   status: "success" | "failed" | "skipped";
   reason?: string;
+  retries?: number;
 }
 
 export interface OcrPipelineResult {
@@ -79,26 +83,32 @@ function getConfig(): OcrConfig {
   const timeout = Number(process.env.OCR_TIMEOUT_MS);
   const glmBase = process.env.GLM_BASE_URL || GLM_DEFAULT_BASE_URL;
   const qwenBase = process.env.QWEN_BASE_URL || QWEN_DEFAULT_BASE_URL;
-  const primaryModel =
-    process.env.GLM_PRIMARY_MODEL || process.env.GLM_MODEL || GLM_PRIMARY_MODEL;
-  const fastModel = process.env.GLM_FALLBACK_MODEL || GLM_FAST_MODEL;
+  const flashxModel =
+    process.env.GLM_FLASHX_MODEL?.trim() || GLM_FLASHX_MODEL;
+  const flashModel = process.env.GLM_FALLBACK_MODEL?.trim() || GLM_FLASH_MODEL;
+  const deepModel =
+    process.env.GLM_ESCALATION_MODEL?.trim() ||
+    process.env.GLM_PRIMARY_MODEL?.trim() ||
+    process.env.GLM_MODEL?.trim() ||
+    GLM_DEEP_MODEL;
 
   return {
-    glmPrimary: glmKey
-      ? { apiKey: glmKey, baseURL: glmBase, model: primaryModel }
+    glmFlashX: glmKey
+      ? { apiKey: glmKey, baseURL: glmBase, model: flashxModel }
       : null,
-    glmFast:
-      glmKey && fastModel !== primaryModel
-        ? { apiKey: glmKey, baseURL: glmBase, model: fastModel }
-        : null,
+    glmFlash: glmKey
+      ? { apiKey: glmKey, baseURL: glmBase, model: flashModel }
+      : null,
+    glmDeep: glmKey
+      ? { apiKey: glmKey, baseURL: glmBase, model: deepModel }
+      : null,
     qwen: qwenKey
       ? {
           apiKey: qwenKey,
           baseURL: qwenBase,
-          model: process.env.QWEN_MODEL || QWEN_VISION_MODEL,
+          model: process.env.QWEN_MODEL?.trim() || QWEN_VISION_MODEL,
         }
       : null,
-    qwenEscalationModel: process.env.QWEN_ESCALATION_MODEL || QWEN_VISION_MODEL,
     timeoutMs:
       Number.isFinite(timeout) && timeout >= 5_000 && timeout <= 120_000
         ? timeout
@@ -111,11 +121,8 @@ export async function runOcrPipeline(
 ): Promise<OcrPipelineResult> {
   const config = getConfig();
   const attempts: OcrAttempt[] = [];
-  const candidates = [config.glmPrimary, config.glmFast, config.qwen].filter(
-    (candidate): candidate is EngineConfig => Boolean(candidate),
-  );
 
-  if (!candidates.length) {
+  if (!config.glmFlashX && !config.qwen) {
     return {
       data: buildMockExtraction(input.kind, input.products, input.parties),
       mock: true,
@@ -132,18 +139,18 @@ export async function runOcrPipeline(
     };
   }
 
-  if (!config.glmPrimary) {
+  if (!config.glmFlashX) {
     attempts.push({
-      model: GLM_PRIMARY_MODEL,
+      model: GLM_FLASHX_MODEL,
       status: "skipped",
       reason: "GLM_API_KEY missing",
     });
   }
-  if (!config.glmFast) {
+  if (!config.glmFlash) {
     attempts.push({
-      model: GLM_FAST_MODEL,
+      model: GLM_FLASH_MODEL,
       status: "skipped",
-      reason: config.glmPrimary ? "Duplicate fast model configured" : "GLM_API_KEY missing",
+      reason: "GLM_API_KEY missing",
     });
   }
   if (!config.qwen) {
@@ -155,40 +162,128 @@ export async function runOcrPipeline(
   }
 
   const systemPrompt = buildSystemPrompt(input.kind, input.products, input.parties);
-  const userPrompt = buildUserPrompt(input.kind);
-  let firstPass: ScanExtraction | null = null;
-  let usedIndex = -1;
-  let warning: string | undefined;
+  const baseUserPrompt = buildUserPrompt(input.kind);
   const failures: string[] = [];
+  const warnings: string[] = [];
 
-  for (let index = 0; index < candidates.length; index += 1) {
-    const engine = candidates[index];
+  let best: ScanExtraction | null = null;
+  let bestSource: "flashx" | "flash" | "qwen" | "glm-deep" | null = null;
+  let flashxSucceeded = false;
+
+  // Stage 1 — dedicated low-cost vision model. This is the only call that can
+  // prove the Z.ai account has usable balance for the paid 4.6v escalation.
+  if (config.glmFlashX) {
     try {
       const raw = await callEngine({
-        engine,
+        engine: config.glmFlashX,
         systemPrompt,
-        userPrompt,
+        userPrompt: baseUserPrompt,
         imageDataUrl: input.imageDataUrl,
         timeoutMs: config.timeoutMs,
       });
-      const parsed = parseAndNormalize(raw, input.products, input.kind, engine.model);
+      const parsed = parseAndNormalize(
+        raw,
+        input.products,
+        input.kind,
+        config.glmFlashX.model,
+      );
       if (!parsed) throw new Error("Vision response did not contain usable line items.");
-      firstPass = parsed;
-      usedIndex = index;
-      attempts.push({ model: engine.model, status: "success" });
-      if (failures.length) {
-        warning = `Primary vision model failed. ${engine.model} fallback parsed this parchi — review amber fields.`;
-      }
-      break;
+      best = parsed;
+      bestSource = "flashx";
+      flashxSucceeded = true;
+      attempts.push({ model: config.glmFlashX.model, status: "success" });
     } catch (error) {
       const reason = errorMessage(error);
-      failures.push(`${engine.model}: ${reason}`);
-      attempts.push({ model: engine.model, status: "failed", reason });
-      console.warn(`[ocr] ${engine.model} failed:`, reason);
+      failures.push(`${config.glmFlashX.model}: ${reason}`);
+      attempts.push({
+        model: config.glmFlashX.model,
+        status: "failed",
+        reason,
+      });
+      console.warn(`[ocr] ${config.glmFlashX.model} failed:`, reason);
     }
   }
 
-  if (!firstPass) {
+  // Stage 2 — free-tier flash fallback. Retry overloaded 429 responses up to
+  // twice; an insufficient-balance 429 is terminal because retrying cannot help.
+  if (!best && config.glmFlash) {
+    try {
+      const result = await callEngineWithRetry({
+        engine: config.glmFlash,
+        systemPrompt,
+        userPrompt: baseUserPrompt,
+        imageDataUrl: input.imageDataUrl,
+        timeoutMs: config.timeoutMs,
+        maxRetries: FLASH_429_RETRIES,
+      });
+      const parsed = parseAndNormalize(
+        result.raw,
+        input.products,
+        input.kind,
+        config.glmFlash.model,
+      );
+      if (!parsed) throw new Error("Vision response did not contain usable line items.");
+      best = parsed;
+      bestSource = "flash";
+      attempts.push({
+        model: config.glmFlash.model,
+        status: "success",
+        retries: result.retries,
+      });
+    } catch (error) {
+      const reason = errorMessage(error);
+      failures.push(`${config.glmFlash.model}: ${reason}`);
+      attempts.push({
+        model: config.glmFlash.model,
+        status: "failed",
+        reason,
+        retries: retryCount(error),
+      });
+      console.warn(`[ocr] ${config.glmFlash.model} failed:`, reason);
+    }
+  }
+
+  // Stage 3 — cross-provider Qwen backup whenever Z.ai produced no usable
+  // result, or the Z.ai result is below the review threshold.
+  if (config.qwen && (!best || best.confidence_score < 0.75)) {
+    try {
+      const raw = await callEngine({
+        engine: config.qwen,
+        systemPrompt,
+        userPrompt: best
+          ? buildReviewPrompt(baseUserPrompt, best, config.qwen.model)
+          : baseUserPrompt,
+        imageDataUrl: input.imageDataUrl,
+        timeoutMs: config.timeoutMs,
+      });
+      const parsed = parseAndNormalize(
+        raw,
+        input.products,
+        input.kind,
+        config.qwen.model,
+      );
+      if (!parsed) throw new Error("Vision response did not contain usable line items.");
+      attempts.push({ model: config.qwen.model, status: "success" });
+      if (!best || parsed.confidence_score > best.confidence_score) {
+        best = parsed;
+        bestSource = "qwen";
+      }
+    } catch (error) {
+      const reason = errorMessage(error);
+      failures.push(`${config.qwen.model}: ${reason}`);
+      attempts.push({
+        model: config.qwen.model,
+        status: "failed",
+        reason,
+      });
+      warnings.push(
+        "qwen-vl-plus backup failed. Verify every amber field before saving.",
+      );
+      console.warn(`[ocr] ${config.qwen.model} backup failed:`, reason);
+    }
+  }
+
+  if (!best) {
     return {
       data: buildMockExtraction(input.kind, input.products, input.parties),
       mock: true,
@@ -199,65 +294,166 @@ export async function runOcrPipeline(
     };
   }
 
-  let final = firstPass;
-
-  // One escalation pass. Qwen VL Plus is the designated vision reviewer.
-  if (firstPass.confidence_score < 0.75 && config.qwen) {
-    const escalationModel = config.qwenEscalationModel;
+  // Stage 4 — paid 4.6v escalation is allowed only when flashx already proved
+  // that the account has balance, and only while the best result is still low.
+  if (
+    flashxSucceeded &&
+    config.glmDeep &&
+    best.confidence_score < 0.75
+  ) {
     try {
       const raw = await callEngine({
-        engine: { ...config.qwen, model: escalationModel },
+        engine: config.glmDeep,
         systemPrompt,
-        userPrompt: `${userPrompt}\n\nFIRST PASS JSON (uncertain fields):\n${JSON.stringify(
-          firstPass,
-        )}\n\nRe-read the entire parchi, top to bottom, and correct only what the image justifies. Return the complete JSON again.`,
+        userPrompt: buildReviewPrompt(baseUserPrompt, best, config.glmDeep.model),
         imageDataUrl: input.imageDataUrl,
         timeoutMs: config.timeoutMs,
       });
-      const escalated = parseAndNormalize(
+      const parsed = parseAndNormalize(
         raw,
         input.products,
         input.kind,
-        escalationModel,
+        config.glmDeep.model,
       );
-      if (!escalated) throw new Error("Escalation returned no usable line items.");
-      attempts.push({ model: escalationModel, status: "success" });
-      if (escalated.confidence_score > firstPass.confidence_score) {
-        final = escalated;
-        warning = `Low confidence (${Math.round(
-          firstPass.confidence_score * 100,
-        )}%). ${escalationModel} re-checked the parchi and improved confidence to ${Math.round(
-          escalated.confidence_score * 100,
-        )}%.`;
+      if (!parsed) throw new Error("Vision response did not contain usable line items.");
+      attempts.push({ model: config.glmDeep.model, status: "success" });
+      if (parsed.confidence_score > best.confidence_score) {
+        const before = Math.round(best.confidence_score * 100);
+        best = parsed;
+        bestSource = "glm-deep";
+        warnings.push(
+          `Low confidence (${before}%). glm-4.6v escalation improved it to ${Math.round(
+            parsed.confidence_score * 100,
+          )}%.`,
+        );
       } else {
-        warning = "Low confidence. The qwen-vl-plus escalation pass did not improve the result — verify every amber field.";
+        warnings.push(
+          "glm-4.6v escalation did not improve the low-confidence result. Verify every amber field.",
+        );
       }
     } catch (error) {
       const reason = errorMessage(error);
-      failures.push(`${escalationModel}: ${reason}`);
-      attempts.push({ model: escalationModel, status: "failed", reason });
-      warning =
-        "Vision confidence is low and the qwen-vl-plus escalation pass failed. Verify every amber field before saving.";
-      console.warn(`[ocr] ${escalationModel} escalation failed:`, reason);
+      failures.push(`${config.glmDeep.model}: ${reason}`);
+      attempts.push({
+        model: config.glmDeep.model,
+        status: "failed",
+        reason,
+      });
+      warnings.push(
+        "glm-4.6v escalation failed. Verify every amber field before saving.",
+      );
+      console.warn(`[ocr] ${config.glmDeep.model} escalation failed:`, reason);
     }
-  } else if (firstPass.confidence_score < 0.75) {
-    warning =
-      "Vision confidence is low. Qwen escalation is unavailable; verify every amber field before saving.";
   }
 
-  if (usedIndex > 0) {
-    warning =
-      warning ||
-      "A fallback vision model parsed this parchi. Review amber fields before saving.";
+  if (bestSource === "flash") {
+    warnings.push(
+      "glm-4.6v-flashx failed, so the free glm-4.6v-flash model parsed this parchi. Review every amber field before saving.",
+    );
+  }
+  if (bestSource === "qwen" && !flashxSucceeded) {
+    warnings.push(
+      "Z.ai did not produce a confident result; qwen-vl-plus cross-provider backup parsed this parchi.",
+    );
+  }
+  if (bestSource === "qwen" && flashxSucceeded) {
+    warnings.push(
+      "Low confidence on glm-4.6v-flashx; qwen-vl-plus re-checked the parchi. Review every amber field.",
+    );
+  }
+  if (best.confidence_score < 0.75) {
+    warnings.push(
+      "Vision confidence remains below 75%. Verify every amber field before saving.",
+    );
   }
 
   return {
-    data: final,
+    data: best,
     mock: false,
-    warning,
+    warning: warnings.length ? [...new Set(warnings)].join(" ") : undefined,
     debugError: failures.length ? failures.join(" | ") : undefined,
     attempts,
   };
+}
+
+function buildReviewPrompt(
+  baseUserPrompt: string,
+  firstPass: ScanExtraction,
+  model: string,
+) {
+  return `${baseUserPrompt}
+
+FIRST PASS JSON (uncertain fields):
+${JSON.stringify(firstPass)}
+
+Re-read the entire parchi from top to bottom as ${model}. Correct only what the image justifies. Return the complete JSON again.`;
+}
+
+async function callEngineWithRetry({
+  maxRetries,
+  ...args
+}: {
+  engine: EngineConfig;
+  systemPrompt: string;
+  userPrompt: string;
+  imageDataUrl: string;
+  timeoutMs: number;
+  maxRetries: number;
+}): Promise<{ raw: Record<string, unknown>; retries: number }> {
+  let retries = 0;
+  while (true) {
+    try {
+      const raw = await callEngine(args);
+      return { raw, retries };
+    } catch (error) {
+      if (retries >= maxRetries || !isRetryableOverload(error)) {
+        throw withRetryCount(error, retries);
+      }
+      retries += 1;
+      console.warn(
+        `[ocr] ${args.engine.model} overloaded (attempt ${retries}/${maxRetries + 1}); retrying in ${FLASH_429_BACKOFF_MS}ms`,
+      );
+      await sleep(FLASH_429_BACKOFF_MS);
+    }
+  }
+}
+
+function isRetryableOverload(error: unknown) {
+  const status = errorStatus(error);
+  const message = errorText(error).toLowerCase();
+  if (status !== 429 && !/\b429\b/.test(message)) return false;
+  return !/insufficient balance|no resource package|quota|billing|recharge|credit/.test(
+    message,
+  );
+}
+
+function errorStatus(error: unknown) {
+  const candidate = error as { status?: number; response?: { status?: number } };
+  return candidate?.status ?? candidate?.response?.status;
+}
+
+function errorText(error: unknown) {
+  const candidate = error as {
+    message?: string;
+    error?: { message?: string };
+  };
+  return `${candidate?.message || ""} ${candidate?.error?.message || ""}`;
+}
+
+function retryCount(error: unknown) {
+  const candidate = error as { ocrRetries?: number };
+  return candidate?.ocrRetries || 0;
+}
+
+function withRetryCount(error: unknown, retries: number) {
+  if (error && typeof error === "object") {
+    (error as { ocrRetries?: number }).ocrRetries = retries;
+  }
+  return error;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function callEngine({

@@ -2,8 +2,11 @@ import { NextResponse } from "next/server";
 import { buildMockExtraction, runOcrPipeline } from "@/lib/ocrEngine";
 import type { Party, Product, ScanKind } from "@/lib/types";
 
+// Vision waterfall (implemented in runOcrPipeline):
+// glm-4.6v-flashx → glm-4.6v-flash (2× 429 backoff) → qwen-vl-plus backup
+// → glm-4.6v only when confidence < 0.75 and flashx proved paid balance.
 export const runtime = "nodejs";
-export const maxDuration = 90;
+export const maxDuration = 180;
 
 interface ScanRequest {
   imageDataUrl?: string;

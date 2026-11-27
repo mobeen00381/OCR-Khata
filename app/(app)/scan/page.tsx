@@ -601,7 +601,7 @@ function ScanningStage({
 
         <div className="mt-4 flex items-center gap-2 text-[9px] font-medium text-slate-400">
           <ShieldCheck className="h-3 w-3" />
-          glm-4.6v → glm-4.6v-flash → qwen-vl-plus · secure server route
+          glm-4.6v-flashx → glm-4.6v-flash → qwen-vl-plus → glm-4.6v (low confidence) · secure server route
         </div>
       </Card>
     </div>

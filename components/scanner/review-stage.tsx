@@ -46,6 +46,7 @@ import { CreateItemModal } from "./create-item-modal";
 const MODEL_LABELS: Record<string, string> = {
   "glm-4.6v": "GLM 4.6V",
   "glm-4.6v-flash": "GLM 4.6V Flash",
+  "glm-4.6v-flashx": "GLM 4.6V FlashX",
   "qwen-vl-plus": "Qwen VL Plus",
   "mock-fallback": "Mock fallback",
 };

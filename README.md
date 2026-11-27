@@ -61,14 +61,14 @@ Copy `.env.example` to `.env.local`.
 
 | Variable | Purpose |
 | --- | --- |
-| `GLM_API_KEY` | Z.ai key for the primary **glm-4.6v** vision model. |
+| `GLM_API_KEY` | Z.ai key for the GLM 4.6V waterfall. |
 | `GLM_BASE_URL` | Defaults to `https://api.z.ai/api/paas/v4`. |
-| `GLM_PRIMARY_MODEL` | Defaults to `glm-4.6v`. |
-| `GLM_FALLBACK_MODEL` | Defaults to `glm-4.6v-flash`. |
-| `QWEN_API_KEY` | Alibaba DashScope key for the final fallback and escalation model. |
+| `GLM_FLASHX_MODEL` | Defaults to `glm-4.6v-flashx` — first, low-cost vision pass. |
+| `GLM_FALLBACK_MODEL` | Defaults to `glm-4.6v-flash` — free-tier fallback with two 429 retries. |
+| `GLM_ESCALATION_MODEL` | Defaults to `glm-4.6v` — only used for low-confidence results after FlashX succeeds. |
+| `QWEN_API_KEY` | Alibaba DashScope key for the cross-provider backup. |
 | `QWEN_BASE_URL` | Defaults to `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. |
 | `QWEN_MODEL` | Defaults to `qwen-vl-plus`. |
-| `QWEN_ESCALATION_MODEL` | Low-confidence reviewer, default `qwen-vl-plus`. |
 | `OCR_TIMEOUT_MS` | Per-provider request deadline, default `30000`. |
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Anon key for the optional browser upload/auth helper. |
@@ -90,15 +90,15 @@ Copy `.env.example` to `.env.local`.
 
 The scan queue shows the live `Compressed: 4.2 MB → 142 KB` readout from this helper.
 
-### Vision OCR pipeline
+### Vision OCR waterfall
 
 `app/api/scan-bill/route.ts` delegates to `lib/ocrEngine.ts`:
 
-1. **glm-4.6v** is called first with the full product/party context, the image and `response_format: { type: "json_object" }` at temperature `0.1`.
-2. If it errors, times out or returns unusable JSON, **glm-4.6v-flash** is tried.
-3. If GLM is unavailable or fails, **qwen-vl-plus** is tried.
-4. If the first valid result has `confidence_score < 0.75` and a Qwen key exists, **qwen-vl-plus** gets one escalation pass; the higher-confidence result wins.
-5. Only if no keys are configured or every configured model fails, a clearly labelled **`mock-fallback`** extraction is returned.
+1. **glm-4.6v-flashx** is called first with the full product/party context, the image and `response_format: { type: "json_object" }` at temperature `0.1`.
+2. If FlashX fails or times out, **glm-4.6v-flash** (free tier) is tried with up to **two retries** and a **1,500 ms** delay on HTTP **429 overload**. A 429 insufficient-balance response is terminal because retrying cannot recover it.
+3. If Z.ai fails or the first usable result has `confidence_score < 0.75`, **qwen-vl-plus** is called as a cross-provider backup when `QWEN_API_KEY` is configured.
+4. **glm-4.6v** is used only when the best result is still below `0.75` **and** `glm-4.6v-flashx` already succeeded, proving the account has paid balance. It is never used as an unconditional fallback.
+5. If no keys are configured or every model fails, a clearly labelled **`mock-fallback`** extraction is returned.
 
 The response includes `model_used` and, whenever an API call failed, **`debug_error`** with the exact provider error (credentials redacted). The review card shows a persistent red **MOCK FALLBACK** diagnostic rather than silently presenting sample items as a real result. The prompt explicitly tells the model to read **every handwritten line** without skipping, merging or inventing items. Each line carries a **`matched`** boolean; unmatched/new sizes are highlighted amber with **Pick from Stock** and **Create New Item** actions.
 
@@ -228,7 +228,7 @@ components/
 lib/
   analytics.ts           day/report/ledger calculations
   compressImage.ts       canvas-only 1280px / 0.78 → 0.70 compressor
-  ocrEngine.ts           glm-4.6v → glm-4.6v-flash → qwen-vl-plus
+  ocrEngine.ts           glm-4.6v-flashx → glm-4.6v-flash → qwen-vl-plus → conditional glm-4.6v
   demo-data.ts           live demo workspace
   exports.ts             PDF + Excel generators
   store.tsx              local + Supabase repository and sync state
@@ -262,7 +262,7 @@ Verified flows in Chromium (desktop + 390 px mobile):
 - return feed rows show **WAPSI · KHATA** and **Khata adjusted**,
 - a 3000px test photo compressed to 1280×853 JPEG and displayed `375 KB → 39 KB`,
 - a noisy image triggered both encoder passes (`quality 0.78` then `0.70`) and still resized to 1280px,
-- real vision call reached both GLM model IDs; the account returned HTTP 429, and the UI showed the exact `debug_error` in a red mock-fallback diagnostic,
+- real vision calls reached `glm-4.6v-flashx`; it returned 429 without balance, so the free `glm-4.6v-flash` fallback ran all three attempts (two 1,500 ms retries) and also returned 429 overload. Qwen was not configured, and the UI showed the exact `debug_error` in a red mock-fallback diagnostic,
 - simulated unmatched line rendered amber with **Create New Item**; creating the product and saving stored the handwritten string in its aliases and persisted the transaction across reload,
 - local fallback alias learning verified for an existing product and a newly created pipe size,
 - empty Supabase workspace state rendered the **Load Demo Shop Data** banner and completed the simulated seed action,

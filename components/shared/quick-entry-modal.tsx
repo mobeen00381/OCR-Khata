@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ArrowDownLeft, ReceiptText, Wallet } from "lucide-react";
+import { ArrowDownLeft, Loader2, ReceiptText, Wallet } from "lucide-react";
 import { useStore } from "@/lib/store";
 import { formatPKR, roundMoney, toDateKey } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,7 @@ export function QuickEntryModal({
   const [amount, setAmount] = useState("");
   const [description, setDescription] = useState("");
   const [paymentMode, setPaymentMode] = useState<"cash" | "bank">("cash");
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -36,6 +37,7 @@ export function QuickEntryModal({
       setAmount("");
       setDescription("");
       setPaymentMode("cash");
+      setSaving(false);
     }
   }, [open, defaultMode]);
 
@@ -44,7 +46,8 @@ export function QuickEntryModal({
   );
   const numericAmount = Number(amount) || 0;
 
-  function submit() {
+  async function submit() {
+    if (saving) return;
     if (isDayLocked(toDateKey())) {
       toast({
         title: "Aaj ka din locked hai",
@@ -64,31 +67,54 @@ export function QuickEntryModal({
         return;
       }
       const party = state.parties.find((entry) => entry.id === partyId);
-      recordPayment({
-        party_id: partyId,
-        entry_type: "customer_wasooli",
-        description: description.trim() || `Wasooli — ${party?.name || "Customer"}`,
-        amount: roundMoney(numericAmount),
-        payment_mode: paymentMode,
-      });
-      toast({
-        title: "Wasooli record ho gayi",
-        description: `${formatPKR(numericAmount)} ${party?.name || "customer"} ke khate mein jama.`,
-      });
+      setSaving(true);
+      try {
+        await recordPayment({
+          party_id: partyId,
+          entry_type: "customer_wasooli",
+          description: description.trim() || `Wasooli — ${party?.name || "Customer"}`,
+          amount: roundMoney(numericAmount),
+          payment_mode: paymentMode,
+        });
+        toast({
+          title: "Wasooli record ho gayi",
+          description: `${formatPKR(numericAmount)} ${party?.name || "customer"} ke khate mein jama.`,
+        });
+        onClose();
+      } catch (error) {
+        toast({
+          title: "Wasooli save nahi hui",
+          description: error instanceof Error ? error.message : "Dobara try karein.",
+          tone: "error",
+        });
+      } finally {
+        setSaving(false);
+      }
     } else {
-      recordPayment({
-        party_id: null,
-        entry_type: "shop_expense",
-        description: description.trim() || "Shop expense",
-        amount: roundMoney(numericAmount),
-        payment_mode: paymentMode,
-      });
-      toast({
-        title: "Kharcha add ho gaya",
-        description: `${formatPKR(numericAmount)} Roznamcha mein darj.`,
-      });
+      setSaving(true);
+      try {
+        await recordPayment({
+          party_id: null,
+          entry_type: "shop_expense",
+          description: description.trim() || "Shop expense",
+          amount: roundMoney(numericAmount),
+          payment_mode: paymentMode,
+        });
+        toast({
+          title: "Kharcha add ho gaya",
+          description: `${formatPKR(numericAmount)} Roznamcha mein darj.`,
+        });
+        onClose();
+      } catch (error) {
+        toast({
+          title: "Kharcha save nahi hua",
+          description: error instanceof Error ? error.message : "Dobara try karein.",
+          tone: "error",
+        });
+      } finally {
+        setSaving(false);
+      }
     }
-    onClose();
   }
 
   return (
@@ -99,12 +125,12 @@ export function QuickEntryModal({
       description="Wasooli ya shop kharcha — galla hisab foran update hoga."
       footer={
         <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={onClose} className="flex-1">
+          <Button variant="outline" onClick={onClose} className="flex-1" disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={submit} className="flex-1">
-            <Wallet className="h-4 w-4" />
-            Save Entry
+          <Button onClick={() => void submit()} className="flex-1" disabled={saving}>
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wallet className="h-4 w-4" />}
+            {saving ? "Saving…" : "Save Entry"}
           </Button>
         </div>
       }

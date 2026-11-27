@@ -137,6 +137,7 @@ export interface ScanItem {
   id: string;
   raw_scanned_name: string;
   matched_product_id: string | null;
+  matched: boolean;
   size: string;
   gauge: string;
   grade: string;
@@ -170,6 +171,7 @@ export interface ScanResponse {
   warning?: string;
   error?: string;
   model_used?: string;
+  debug_error?: string;
 }
 
 export interface ScanDraft {
@@ -181,6 +183,7 @@ export interface ScanDraft {
   extraction?: ScanExtraction;
   mock?: boolean;
   warning?: string;
+  debugError?: string;
   party_id?: string;
   paid_now?: number;
   originalSizeKB?: number;

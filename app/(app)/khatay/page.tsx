@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   ArrowUpRight,
@@ -369,7 +369,7 @@ function NewPartyModal({
   onClose: () => void;
   onSave: (
     input: Omit<Party, "id" | "business_id" | "created_at" | "current_balance">,
-  ) => Party;
+  ) => Promise<Party>;
 }) {
   const { toast } = useToast();
   const [name, setName] = useState("");
@@ -377,8 +377,17 @@ function NewPartyModal({
   const [phone, setPhone] = useState("");
   const [type, setType] = useState<PartyFilter>("customer");
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
 
-  function submit() {
+  useEffect(() => {
+    if (open) {
+      setError("");
+      setSaving(false);
+    }
+  }, [open]);
+
+  async function submit() {
+    if (saving) return;
     if (!name.trim()) {
       setError("Party ka naam zaroori hai.");
       return;
@@ -387,21 +396,28 @@ function NewPartyModal({
       setError("Area / shop likhein — same name wale customers alag rahenge.");
       return;
     }
-    const party = onSave({
-      name: name.trim(),
-      area_or_shop: area.trim(),
-      phone: phone.trim() || "—",
-      type: type as PartyType,
-    });
-    toast({
-      title: "Naya khata ban gaya",
-      description: `${party.name} · ${party.area_or_shop}`,
-    });
-    setName("");
-    setArea("");
-    setPhone("");
-    setError("");
-    onClose();
+    setSaving(true);
+    try {
+      const party = await onSave({
+        name: name.trim(),
+        area_or_shop: area.trim(),
+        phone: phone.trim() || "—",
+        type: type as PartyType,
+      });
+      toast({
+        title: "Naya khata ban gaya",
+        description: `${party.name} · ${party.area_or_shop}`,
+      });
+      setName("");
+      setArea("");
+      setPhone("");
+      setError("");
+      onClose();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Khata save nahi hua.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -412,12 +428,12 @@ function NewPartyModal({
       description="Area tag zaroori hai — warna same name wale Nadeem mix ho jate hain."
       footer={
         <div className="flex gap-2">
-          <Button variant="outline" className="flex-1" onClick={onClose}>
+          <Button variant="outline" className="flex-1" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button className="flex-1" onClick={submit}>
+          <Button className="flex-1" onClick={() => void submit()} disabled={saving}>
             <UserPlus className="h-4 w-4" />
-            Create khata
+            {saving ? "Saving…" : "Create khata"}
           </Button>
         </div>
       }

@@ -559,6 +559,7 @@ function PaymentModal({
   const [amount, setAmount] = useState("");
   const [mode, setMode] = useState<"cash" | "bank">("cash");
   const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
   const isSupplier = party.type === "supplier";
   const locked = isDayLocked(toDateKey());
   const numeric = Number(amount) || 0;
@@ -569,9 +570,11 @@ function PaymentModal({
     setAmount(String(Math.max(0, outstanding)));
     setMode("cash");
     setNote("");
+    setSaving(false);
   }, [open, outstanding]);
 
-  function submit() {
+  async function submit() {
+    if (saving) return;
     if (locked) {
       toast({
         title: "Day locked hai",
@@ -584,20 +587,31 @@ function PaymentModal({
       toast({ title: "Sahi amount likhein", tone: "error" });
       return;
     }
-    recordPayment({
-      party_id: party.id,
-      entry_type: isSupplier ? "supplier_payment" : "customer_wasooli",
-      description:
-        note.trim() ||
-        `${isSupplier ? "Supplier payment" : "Wasooli"} — ${party.name}`,
-      amount: roundMoney(numeric),
-      payment_mode: mode,
-    });
-    toast({
-      title: isSupplier ? "Supplier payment record ho gayi" : "Wasooli record ho gayi",
-      description: `${formatPKR(numeric)} · ${party.name}`,
-    });
-    onClose();
+    setSaving(true);
+    try {
+      await recordPayment({
+        party_id: party.id,
+        entry_type: isSupplier ? "supplier_payment" : "customer_wasooli",
+        description:
+          note.trim() ||
+          `${isSupplier ? "Supplier payment" : "Wasooli"} — ${party.name}`,
+        amount: roundMoney(numeric),
+        payment_mode: mode,
+      });
+      toast({
+        title: isSupplier ? "Supplier payment record ho gayi" : "Wasooli record ho gayi",
+        description: `${formatPKR(numeric)} · ${party.name}`,
+      });
+      onClose();
+    } catch (error) {
+      toast({
+        title: "Payment save nahi hui",
+        description: error instanceof Error ? error.message : "Dobara try karein.",
+        tone: "error",
+      });
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -612,12 +626,16 @@ function PaymentModal({
       }
       footer={
         <div className="flex gap-2">
-          <Button variant="outline" onClick={onClose} className="flex-1">
+          <Button variant="outline" onClick={onClose} className="flex-1" disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={submit} className="flex-1" disabled={locked}>
-            <Wallet className="h-4 w-4" />
-            Save payment
+          <Button onClick={() => void submit()} className="flex-1" disabled={locked || saving}>
+            {saving ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Wallet className="h-4 w-4" />
+            )}
+            {saving ? "Saving…" : "Save payment"}
           </Button>
         </div>
       }

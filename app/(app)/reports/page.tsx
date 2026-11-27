@@ -67,6 +67,7 @@ export default function ReportsPage() {
   const [pinOpen, setPinOpen] = useState(false);
   const [pin, setPin] = useState("");
   const [pinError, setPinError] = useState("");
+  const [pinSaving, setPinSaving] = useState(false);
   const [selectedBill, setSelectedBill] = useState<TransactionWithItems | null>(null);
 
   const singleDay = range.from === range.to;
@@ -167,30 +168,39 @@ export default function ReportsPage() {
     }
     setPin("");
     setPinError("");
+    setPinSaving(false);
     setPinOpen(true);
   }
 
-  function submitPin() {
+  async function submitPin() {
+    if (pinSaving) return;
     if (pin !== OWNER_PIN) {
       setPinError("Ghalat PIN. Demo PIN 1234 hai.");
       return;
     }
-    if (locked) {
-      reopenDay(range.from);
-      toast({
-        title: "Day unlock ho gaya",
-        description: `${formatDate(range.from)} ki entries ab editable hain.`,
-        tone: "success",
-      });
-    } else {
-      closeDay(range.from, Number(openingCash) || 0);
-      toast({
-        title: "Day close & lock ho gaya",
-        description: `${formatDate(range.from)} ki entries staff edits se lock hain.`,
-        tone: "success",
-      });
+    setPinSaving(true);
+    try {
+      if (locked) {
+        await reopenDay(range.from);
+        toast({
+          title: "Day unlock ho gaya",
+          description: `${formatDate(range.from)} ki entries ab editable hain.`,
+          tone: "success",
+        });
+      } else {
+        await closeDay(range.from, Number(openingCash) || 0);
+        toast({
+          title: "Day close & lock ho gaya",
+          description: `${formatDate(range.from)} ki entries staff edits se lock hain.`,
+          tone: "success",
+        });
+      }
+      setPinOpen(false);
+    } catch (error) {
+      setPinError(error instanceof Error ? error.message : "Day lock save nahi hua.");
+    } finally {
+      setPinSaving(false);
     }
-    setPinOpen(false);
   }
 
   const cashIn = report ? report.cashSales + report.cashWasooli : 0;
@@ -776,10 +786,17 @@ export default function ReportsPage() {
             <Button
               className="flex-1"
               variant={locked ? "outline" : "amber"}
-              onClick={submitPin}
+              onClick={() => void submitPin()}
+              disabled={pinSaving}
             >
-              {locked ? <UnlockKeyhole className="h-4 w-4" /> : <LockKeyhole className="h-4 w-4" />}
-              {locked ? "Unlock" : "Lock day"}
+              {pinSaving ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : locked ? (
+                <UnlockKeyhole className="h-4 w-4" />
+              ) : (
+                <LockKeyhole className="h-4 w-4" />
+              )}
+              {pinSaving ? "Saving…" : locked ? "Unlock" : "Lock day"}
             </Button>
           </div>
         }

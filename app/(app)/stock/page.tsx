@@ -157,27 +157,35 @@ export default function StockPage() {
     setQuery("");
   }
 
-  function saveProduct(product: Product) {
-    if (editing) {
-      updateProduct(editing.id, product);
-      toast({ title: "Product update ho gaya", description: product.name });
-    } else {
-      addProduct({
-        name: product.name,
-        sku_code: product.sku_code,
-        unit: product.unit,
-        weight_per_length: product.weight_per_length,
-        current_stock: product.current_stock,
-        low_stock_alert: product.low_stock_alert,
-        purchase_rate: product.purchase_rate,
-        sale_rate: product.sale_rate,
-        attributes: product.attributes,
-        aliases: product.aliases,
-        last_sold_at: product.last_sold_at,
+  async function saveProduct(product: Product) {
+    try {
+      if (editing) {
+        await updateProduct(editing.id, product);
+        toast({ title: "Product update ho gaya", description: product.name });
+      } else {
+        await addProduct({
+          name: product.name,
+          sku_code: product.sku_code,
+          unit: product.unit,
+          weight_per_length: product.weight_per_length,
+          current_stock: product.current_stock,
+          low_stock_alert: product.low_stock_alert,
+          purchase_rate: product.purchase_rate,
+          sale_rate: product.sale_rate,
+          attributes: product.attributes,
+          aliases: product.aliases,
+          last_sold_at: product.last_sold_at,
+        });
+        toast({ title: "Naya SKU add ho gaya", description: product.name });
+      }
+      setModalOpen(false);
+    } catch (error) {
+      toast({
+        title: "Product save nahi hua",
+        description: error instanceof Error ? error.message : "Dobara try karein.",
+        tone: "error",
       });
-      toast({ title: "Naya SKU add ho gaya", description: product.name });
     }
-    setModalOpen(false);
   }
 
   return (

@@ -11,6 +11,7 @@ import {
   FileWarning,
   Hash,
   ImageOff,
+  Loader2,
   Plus,
   RefreshCw,
   ShieldCheck,
@@ -40,12 +41,13 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Field, Input, Select } from "@/components/ui/input";
 import { PartyAvatar } from "@/components/shared/party-avatar";
+import { CreateItemModal } from "./create-item-modal";
 
 const MODEL_LABELS: Record<string, string> = {
-  "qwen3.8-flash": "Qwen 3.8 Flash",
-  "glm-5.3-flash": "GLM 5.3 Flash",
-  "qwen3-vl-plus": "Qwen VL Plus",
-  "mock-fallback": "Demo parser",
+  "glm-4.6v": "GLM 4.6V",
+  "glm-4.6v-flash": "GLM 4.6V Flash",
+  "qwen-vl-plus": "Qwen VL Plus",
+  "mock-fallback": "Mock fallback",
 };
 
 function modelLabel(modelUsed: string) {
@@ -69,7 +71,7 @@ export function ReviewStage({
   onRetry: () => void;
   onUpdate: (extraction: ScanExtraction) => void;
   onMeta: (patch: Partial<Pick<ScanDraft, "party_id" | "paid_now">>) => void;
-  onConfirm: (input: NewTransactionInput) => void;
+  onConfirm: (input: NewTransactionInput) => Promise<void>;
 }) {
   if (draft.status === "error" || !draft.extraction) {
     return (
@@ -129,10 +131,12 @@ function ReviewContent({
   onBack: () => void;
   onUpdate: (extraction: ScanExtraction) => void;
   onMeta: (patch: Partial<Pick<ScanDraft, "party_id" | "paid_now">>) => void;
-  onConfirm: (input: NewTransactionInput) => void;
+  onConfirm: (input: NewTransactionInput) => Promise<void>;
 }) {
   const { state } = useStore();
   const [duplicateAck, setDuplicateAck] = useState(false);
+  const [createItem, setCreateItem] = useState<ScanItem | null>(null);
+  const [saving, setSaving] = useState(false);
 
   const isPurchase = kinds === "purchase";
   const isReturn = kinds === "return";
@@ -204,13 +208,13 @@ function ReviewContent({
   function selectProduct(itemId: string, productId: string) {
     const product = state.products.find((entry) => entry.id === productId);
     if (!product) {
-      updateItem(itemId, { matched_product_id: null });
+      updateItem(itemId, { matched_product_id: null, matched: false });
       return;
     }
     const defaultRate = isPurchase ? product.purchase_rate : product.sale_rate;
     updateItem(itemId, {
       matched_product_id: product.id,
-      raw_scanned_name: product.name,
+      matched: true,
       size: String(product.attributes?.size || ""),
       gauge: String(product.attributes?.gauge || ""),
       grade: String(product.attributes?.grade || ""),
@@ -228,6 +232,7 @@ function ReviewContent({
       id: `manual_${Date.now()}`,
       raw_scanned_name: product.name,
       matched_product_id: product.id,
+      matched: true,
       size: String(product.attributes?.size || ""),
       gauge: String(product.attributes?.gauge || ""),
       grade: String(product.attributes?.grade || ""),
@@ -245,6 +250,22 @@ function ReviewContent({
     patch({ items: extraction.items.filter((item) => item.id !== id) });
   }
 
+  function handleNewProduct(product: (typeof state.products)[number]) {
+    if (!createItem) return;
+    updateItem(createItem.id, {
+      matched_product_id: product.id,
+      matched: true,
+      raw_scanned_name: createItem.raw_scanned_name,
+      size: String(product.attributes?.size || createItem.size),
+      gauge: String(product.attributes?.gauge || createItem.gauge),
+      grade: String(product.attributes?.grade || createItem.grade),
+      shape: String(product.attributes?.shape || createItem.shape),
+      unit: product.unit,
+      rate: isPurchase ? product.purchase_rate : product.sale_rate,
+    });
+    setCreateItem(null);
+  }
+
   const canSave =
     !locked &&
     extraction.items.length > 0 &&
@@ -255,14 +276,14 @@ function ReviewContent({
     (!duplicate || duplicateAck);
 
   function confirm() {
-    if (!canSave) return;
+    if (!canSave || saving) return;
     const partyId = isCash
       ? isPurchase && selectedParty?.type === "supplier"
         ? selectedParty.id
         : walkIn?.id || state.parties[0]?.id || ""
       : selectedParty?.id || "";
-
-    onConfirm({
+    setSaving(true);
+    void onConfirm({
       party_id: partyId,
       parchi_number: (extraction.parchi_number || "").trim() || null,
       type: isReturn ? "sale_return" : isPurchase ? "purchase" : "sale",
@@ -282,7 +303,7 @@ function ReviewContent({
         rate: item.rate,
         amount: roundMoney(item.qty * item.rate),
       })),
-    });
+    }).finally(() => setSaving(false));
   }
 
   return (
@@ -397,6 +418,49 @@ function ReviewContent({
             </p>
           </div>
         )}
+
+        <div
+          className={cn(
+            "rounded-xl border px-3 py-2.5",
+            draft.mock
+              ? "border-red-200 bg-red-50"
+              : "border-emerald-200 bg-white",
+          )}
+        >
+          <div className="flex items-start gap-2">
+            <span
+              className={cn(
+                "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full",
+                draft.mock ? "bg-red-100 text-crimson" : "bg-emerald-100 text-emerald-700",
+              )}
+            >
+              <ShieldCheck className="h-3 w-3" />
+            </span>
+            <div className="min-w-0">
+              <p
+                className={cn(
+                  "text-[9.5px] font-bold",
+                  draft.mock ? "text-crimson" : "text-emerald-800",
+                )}
+              >
+                {draft.mock
+                  ? "MOCK FALLBACK — not a real vision result"
+                  : `Real AI Vision · ${modelLabel(extraction.model_used)}`}
+              </p>
+              {draft.debugError ? (
+                <p className="mt-1 break-words font-mono text-[8px] leading-relaxed text-slate-500">
+                  {draft.debugError}
+                </p>
+              ) : (
+                <p className="mt-0.5 text-[8.5px] leading-relaxed text-ink-mute">
+                  {draft.mock
+                    ? "No live vision model returned a parse. Verify every field before saving."
+                    : "Live vision extraction completed successfully."}
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
 
         <Button variant="outline" className="w-full" onClick={onBack}>
           <ChevronLeft className="h-4 w-4" />
@@ -614,14 +678,20 @@ function ReviewContent({
               const product = state.products.find(
                 (entry) => entry.id === item.matched_product_id,
               );
+              const unmatched = !item.matched || !item.matched_product_id;
               const low = item.confidence < 0.75;
+              const highlight = unmatched || low;
               const amount = roundMoney(item.qty * item.rate);
               return (
                 <div
                   key={item.id}
                   className={cn(
                     "p-3.5 md:px-4",
-                    low && "border-l-2 border-l-amber-400 bg-amber-50/25",
+                    unmatched
+                      ? "border-l-2 border-l-amber-500 bg-amber-50/40"
+                      : low
+                        ? "border-l-2 border-l-amber-400 bg-amber-50/25"
+                        : "",
                   )}
                 >
                   <div className="mb-2 flex items-center justify-between gap-2 md:hidden">
@@ -629,7 +699,13 @@ function ReviewContent({
                       Item {index + 1}
                     </span>
                     <div className="flex items-center gap-1.5">
-                      {low ? <Badge tone="amber">Check</Badge> : <Badge tone="emerald">Matched</Badge>}
+                      {unmatched ? (
+                        <Badge tone="amber">New item</Badge>
+                      ) : low ? (
+                        <Badge tone="amber">Check</Badge>
+                      ) : (
+                        <Badge tone="emerald">Matched</Badge>
+                      )}
                       <button
                         type="button"
                         onClick={() => removeItem(item.id)}
@@ -649,10 +725,10 @@ function ReviewContent({
                           onChange={(event) => selectProduct(item.id, event.target.value)}
                           className={cn(
                             "h-10 min-h-[40px] pl-2.5 text-[11px] font-semibold",
-                            low && "border-amber-300 bg-amber-50/60",
+                            highlight && "border-amber-300 bg-amber-50/60",
                           )}
                         >
-                          <option value="">Unmatched — select product</option>
+                          <option value="">Pick from Stock / unmatched</option>
                           {state.products.map((entry) => (
                             <option key={entry.id} value={entry.id}>
                               {entry.attributes.size} · {entry.attributes.gauge} ·{" "}
@@ -669,7 +745,16 @@ function ReviewContent({
                           <span className="rounded border border-line bg-slate-50 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-[0.04em] text-ink-mute">
                             {formatQty(product.current_stock, product.unit)} in stock
                           </span>
-                        ) : null}
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setCreateItem(item)}
+                            className="inline-flex items-center gap-1 rounded border border-amber-300 bg-white px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-[0.04em] text-amber-700 transition hover:bg-amber-50"
+                          >
+                            <Plus className="h-2.5 w-2.5" />
+                            Create New Item
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -688,7 +773,7 @@ function ReviewContent({
                           }
                           className={cn(
                             "h-10 min-h-[40px] px-2 text-center text-[11px] font-bold tabular",
-                            low && "border-amber-300 bg-amber-50/60",
+                            highlight && "border-amber-300 bg-amber-50/60",
                           )}
                         />
                       </div>
@@ -710,7 +795,7 @@ function ReviewContent({
                             }
                             className={cn(
                               "h-10 min-h-[40px] pl-7 pr-2 text-[11px] font-bold tabular",
-                              low && "border-amber-300 bg-amber-50/60",
+                              highlight && "border-amber-300 bg-amber-50/60",
                             )}
                           />
                         </div>
@@ -737,7 +822,12 @@ function ReviewContent({
                   </div>
 
                   <div className="mt-2 hidden items-center gap-2 md:flex">
-                    {low ? (
+                    {unmatched ? (
+                      <span className="flex items-center gap-1 rounded bg-amber-50 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide text-amber-700">
+                        <AlertTriangle className="h-2.5 w-2.5" />
+                        New item · pick or create
+                      </span>
+                    ) : low ? (
                       <span className="flex items-center gap-1 rounded bg-amber-50 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide text-amber-700">
                         <AlertTriangle className="h-2.5 w-2.5" />
                         Check qty / rate
@@ -807,7 +897,7 @@ function ReviewContent({
                     <div>
                       <p className="text-[10.5px] font-bold text-ink">Paid now / Jama</p>
                       <p className="mt-0.5 text-[9px] text-ink-mute">
-                        Khate mein sirf baqi raqam add hogi.
+                        Khata balance confirm par update hoga.
                       </p>
                     </div>
                     <div className="relative w-[130px]">
@@ -875,10 +965,14 @@ function ReviewContent({
                 size="lg"
                 className="mt-4 w-full"
                 onClick={confirm}
-                disabled={!canSave}
+                disabled={!canSave || saving}
               >
-                <CheckCircle2 className="h-4 w-4" />
-                Confirm & Save
+                {saving ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 className="h-4 w-4" />
+                )}
+                {saving ? "Saving…" : "Confirm & Save"}
               </Button>
               <p className="mt-2 text-center text-[8.5px] leading-relaxed text-slate-400">
                 {locked
@@ -900,7 +994,7 @@ function ReviewContent({
         <div className="flex flex-wrap items-center justify-between gap-2 pb-2 text-[9px] text-slate-400">
           <span className="flex items-center gap-1.5">
             <Sparkles className="h-3 w-3 text-amber-500" />
-            AI-extracted draft · human review required
+            Vision-extracted draft · human review required
           </span>
           <span className="flex items-center gap-1.5">
             {isCash ? <Banknote className="h-3 w-3" /> : <BookOpen className="h-3 w-3" />}
@@ -909,6 +1003,14 @@ function ReviewContent({
         </div>
       </div>
     </div>
+
+    <CreateItemModal
+      open={Boolean(createItem)}
+      item={createItem}
+      purchaseMode={isPurchase}
+      onClose={() => setCreateItem(null)}
+      onCreated={handleNewProduct}
+    />
   </div>
   );
 }

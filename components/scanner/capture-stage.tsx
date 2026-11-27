@@ -181,8 +181,8 @@ export function CaptureStage({
 
           <div className="relative flex items-center justify-between gap-3">
             <Badge tone="dark" dot className="border-white/10 bg-white/5 text-emerald-300 backdrop-blur">
-              <span className="sm:hidden">Dual OCR · Qwen + GLM</span>
-              <span className="hidden sm:inline">Dual OCR · Qwen 3.8 + GLM 5.3</span>
+              <span className="sm:hidden">Vision OCR · GLM + Qwen</span>
+              <span className="hidden sm:inline">Vision OCR · GLM 4.6V + Qwen VL Plus</span>
             </Badge>
             <span className="hidden text-[9px] font-bold uppercase tracking-[0.14em] text-slate-500 sm:inline">
               {activeKind.roman}

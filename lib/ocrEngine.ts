@@ -10,13 +10,13 @@ import type {
   ScanKind,
 } from "./types";
 
-const QWEN_DEFAULT_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const GLM_DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4";
-const QWEN_PRIMARY_MODEL = "qwen3.8-flash";
-const QWEN_ESCALATION_MODEL = "qwen3-vl-plus";
-const GLM_FALLBACK_MODEL = "glm-5.3-flash";
+const QWEN_DEFAULT_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+const GLM_PRIMARY_MODEL = "glm-4.6v";
+const GLM_FAST_MODEL = "glm-4.6v-flash";
+const QWEN_VISION_MODEL = "qwen-vl-plus";
 const MOCK_MODEL = "mock-fallback";
-const DEFAULT_TIMEOUT_MS = 28_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 const UNIT_VALUES: ProductUnit[] = ["length", "kg", "pcs"];
 
@@ -27,15 +27,16 @@ interface EngineConfig {
 }
 
 interface OcrConfig {
+  glmPrimary: EngineConfig | null;
+  glmFast: EngineConfig | null;
   qwen: EngineConfig | null;
-  qwenEscalation: string;
-  glm: EngineConfig | null;
+  qwenEscalationModel: string;
   timeoutMs: number;
 }
 
 export interface OcrAttempt {
   model: string;
-  status: "success" | "failed" | "invalid" | "skipped";
+  status: "success" | "failed" | "skipped";
   reason?: string;
 }
 
@@ -43,6 +44,7 @@ export interface OcrPipelineResult {
   data: ScanExtraction;
   mock: boolean;
   warning?: string;
+  debugError?: string;
   attempts: OcrAttempt[];
 }
 
@@ -62,7 +64,7 @@ const kindCopy: Record<ScanKind, { label: string; instruction: string }> = {
   purchase: {
     label: "Purchase / stock list (Aaya Hua Maal)",
     instruction:
-      "This is incoming stock, likely from a supplier or a stock register page. Read pipe specifications and quantities received. Treat manually written stock rows as purchase items.",
+      "This is incoming stock, likely from a supplier or a stock register page. Read pipe specifications and quantities received. Treat every written stock row as a separate purchase item.",
   },
   return: {
     label: "Customer return (Maal Wapsi / sale_return)",
@@ -72,25 +74,31 @@ const kindCopy: Record<ScanKind, { label: string; instruction: string }> = {
 };
 
 function getConfig(): OcrConfig {
-  const qwenKey = process.env.QWEN_API_KEY?.trim() || "";
   const glmKey = process.env.GLM_API_KEY?.trim() || "";
+  const qwenKey = process.env.QWEN_API_KEY?.trim() || "";
   const timeout = Number(process.env.OCR_TIMEOUT_MS);
+  const glmBase = process.env.GLM_BASE_URL || GLM_DEFAULT_BASE_URL;
+  const qwenBase = process.env.QWEN_BASE_URL || QWEN_DEFAULT_BASE_URL;
+  const primaryModel =
+    process.env.GLM_PRIMARY_MODEL || process.env.GLM_MODEL || GLM_PRIMARY_MODEL;
+  const fastModel = process.env.GLM_FALLBACK_MODEL || GLM_FAST_MODEL;
+
   return {
+    glmPrimary: glmKey
+      ? { apiKey: glmKey, baseURL: glmBase, model: primaryModel }
+      : null,
+    glmFast:
+      glmKey && fastModel !== primaryModel
+        ? { apiKey: glmKey, baseURL: glmBase, model: fastModel }
+        : null,
     qwen: qwenKey
       ? {
           apiKey: qwenKey,
-          baseURL: process.env.QWEN_BASE_URL || QWEN_DEFAULT_BASE_URL,
-          model: process.env.QWEN_MODEL || QWEN_PRIMARY_MODEL,
+          baseURL: qwenBase,
+          model: process.env.QWEN_MODEL || QWEN_VISION_MODEL,
         }
       : null,
-    qwenEscalation: process.env.QWEN_ESCALATION_MODEL || QWEN_ESCALATION_MODEL,
-    glm: glmKey
-      ? {
-          apiKey: glmKey,
-          baseURL: process.env.GLM_BASE_URL || GLM_DEFAULT_BASE_URL,
-          model: process.env.GLM_MODEL || GLM_FALLBACK_MODEL,
-        }
-      : null,
+    qwenEscalationModel: process.env.QWEN_ESCALATION_MODEL || QWEN_VISION_MODEL,
     timeoutMs:
       Number.isFinite(timeout) && timeout >= 5_000 && timeout <= 120_000
         ? timeout
@@ -98,70 +106,86 @@ function getConfig(): OcrConfig {
   };
 }
 
-export async function runOcrPipeline(input: OcrPipelineInput): Promise<OcrPipelineResult> {
+export async function runOcrPipeline(
+  input: OcrPipelineInput,
+): Promise<OcrPipelineResult> {
   const config = getConfig();
   const attempts: OcrAttempt[] = [];
+  const candidates = [config.glmPrimary, config.glmFast, config.qwen].filter(
+    (candidate): candidate is EngineConfig => Boolean(candidate),
+  );
 
-  if (!config.qwen && !config.glm) {
+  if (!candidates.length) {
     return {
       data: buildMockExtraction(input.kind, input.products, input.parties),
       mock: true,
       warning:
-        "Demo parse: QWEN_API_KEY / GLM_API_KEY not configured. Add an OCR key in .env.local for real handwritten parchis.",
-      attempts: [{ model: MOCK_MODEL, status: "success", reason: "No OCR API keys configured" }],
+        "Mock fallback in use: no real vision model is configured. Add GLM_API_KEY or QWEN_API_KEY in .env.local and reload.",
+      debugError: "No OCR API key configured (GLM_API_KEY / QWEN_API_KEY missing).",
+      attempts: [
+        {
+          model: MOCK_MODEL,
+          status: "success",
+          reason: "No vision provider keys configured",
+        },
+      ],
     };
   }
 
-  const systemPrompt = buildSystemPrompt(input.kind, input.products, input.parties);
-  const userPrompt = buildUserPrompt(input.kind, input.imageDataUrl);
-
-  let firstPass: ScanExtraction | null = null;
-  let warning: string | undefined;
-
-  if (config.qwen) {
-    try {
-      const raw = await callEngine({
-        engine: config.qwen,
-        systemPrompt,
-        userPrompt,
-        imageDataUrl: input.imageDataUrl,
-        timeoutMs: config.timeoutMs,
-      });
-      const parsed = parseAndNormalize(raw, input.products, input.kind, config.qwen.model);
-      if (!parsed) throw new Error("OCR response did not contain usable items.");
-      firstPass = parsed;
-      attempts.push({ model: config.qwen.model, status: "success" });
-    } catch (error) {
-      const reason = errorMessage(error);
-      attempts.push({ model: config.qwen.model, status: "failed", reason });
-      console.warn("[ocr] Primary Qwen pass failed:", reason);
-    }
-  } else {
-    attempts.push({ model: QWEN_PRIMARY_MODEL, status: "skipped", reason: "QWEN_API_KEY missing" });
+  if (!config.glmPrimary) {
+    attempts.push({
+      model: GLM_PRIMARY_MODEL,
+      status: "skipped",
+      reason: "GLM_API_KEY missing",
+    });
+  }
+  if (!config.glmFast) {
+    attempts.push({
+      model: GLM_FAST_MODEL,
+      status: "skipped",
+      reason: config.glmPrimary ? "Duplicate fast model configured" : "GLM_API_KEY missing",
+    });
+  }
+  if (!config.qwen) {
+    attempts.push({
+      model: QWEN_VISION_MODEL,
+      status: "skipped",
+      reason: "QWEN_API_KEY missing",
+    });
   }
 
-  if (!firstPass && config.glm) {
+  const systemPrompt = buildSystemPrompt(input.kind, input.products, input.parties);
+  const userPrompt = buildUserPrompt(input.kind);
+  let firstPass: ScanExtraction | null = null;
+  let usedIndex = -1;
+  let warning: string | undefined;
+  const failures: string[] = [];
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const engine = candidates[index];
     try {
       const raw = await callEngine({
-        engine: config.glm,
+        engine,
         systemPrompt,
         userPrompt,
         imageDataUrl: input.imageDataUrl,
         timeoutMs: config.timeoutMs,
       });
-      const parsed = parseAndNormalize(raw, input.products, input.kind, config.glm.model);
-      if (!parsed) throw new Error("OCR response did not contain usable items.");
+      const parsed = parseAndNormalize(raw, input.products, input.kind, engine.model);
+      if (!parsed) throw new Error("Vision response did not contain usable line items.");
       firstPass = parsed;
-      attempts.push({ model: config.glm.model, status: "success" });
-      warning =
-        "Qwen primary pass unavailable. GLM-5.3 Flash fallback parsed this parchi — review amber fields carefully.";
+      usedIndex = index;
+      attempts.push({ model: engine.model, status: "success" });
+      if (failures.length) {
+        warning = `Primary vision model failed. ${engine.model} fallback parsed this parchi — review amber fields.`;
+      }
+      break;
     } catch (error) {
       const reason = errorMessage(error);
-      attempts.push({ model: config.glm.model, status: "failed", reason });
-      console.warn("[ocr] GLM fallback failed:", reason);
+      failures.push(`${engine.model}: ${reason}`);
+      attempts.push({ model: engine.model, status: "failed", reason });
+      console.warn(`[ocr] ${engine.model} failed:`, reason);
     }
-  } else if (!config.glm && !firstPass) {
-    attempts.push({ model: GLM_FALLBACK_MODEL, status: "skipped", reason: "GLM_API_KEY missing" });
   }
 
   if (!firstPass) {
@@ -169,25 +193,24 @@ export async function runOcrPipeline(input: OcrPipelineInput): Promise<OcrPipeli
       data: buildMockExtraction(input.kind, input.products, input.parties),
       mock: true,
       warning:
-        "OCR providers did not return a readable result. A realistic demo parse is shown so the review flow stays usable — check API keys and image quality.",
+        "All configured vision models failed. A demo parse is shown so the UI stays usable — check the diagnostic below before saving.",
+      debugError: failures.join(" | ") || "All configured vision providers failed.",
       attempts,
     };
   }
 
-  // One escalation pass with the vision-optimised Qwen model when the first
-  // valid extraction is uncertain. Keep the higher-confidence result.
   let final = firstPass;
-  if (final.confidence_score < 0.75 && config.qwen) {
+
+  // One escalation pass. Qwen VL Plus is the designated vision reviewer.
+  if (firstPass.confidence_score < 0.75 && config.qwen) {
+    const escalationModel = config.qwenEscalationModel;
     try {
       const raw = await callEngine({
-        engine: {
-          ...config.qwen,
-          model: config.qwenEscalation,
-        },
+        engine: { ...config.qwen, model: escalationModel },
         systemPrompt,
-        userPrompt: `${userPrompt}\n\nFIRST PASS JSON (may contain uncertain fields):\n${JSON.stringify(
+        userPrompt: `${userPrompt}\n\nFIRST PASS JSON (uncertain fields):\n${JSON.stringify(
           firstPass,
-        )}\n\nRe-examine the photo and correct only what you can justify. Return the complete JSON again.`,
+        )}\n\nRe-read the entire parchi, top to bottom, and correct only what the image justifies. Return the complete JSON again.`,
         imageDataUrl: input.imageDataUrl,
         timeoutMs: config.timeoutMs,
       });
@@ -195,31 +218,46 @@ export async function runOcrPipeline(input: OcrPipelineInput): Promise<OcrPipeli
         raw,
         input.products,
         input.kind,
-        config.qwenEscalation,
+        escalationModel,
       );
-      if (!escalated) throw new Error("Escalation response did not contain usable items.");
-      attempts.push({ model: config.qwenEscalation, status: "success" });
+      if (!escalated) throw new Error("Escalation returned no usable line items.");
+      attempts.push({ model: escalationModel, status: "success" });
       if (escalated.confidence_score > firstPass.confidence_score) {
         final = escalated;
-        warning =
-          "First pass confidence was low, so Qwen VL Plus re-checked the parchi. Review amber fields before saving.";
+        warning = `Low confidence (${Math.round(
+          firstPass.confidence_score * 100,
+        )}%). ${escalationModel} re-checked the parchi and improved confidence to ${Math.round(
+          escalated.confidence_score * 100,
+        )}%.`;
       } else {
-        warning =
-          "First pass confidence was low. The escalation pass did not improve it — verify amber fields carefully.";
+        warning = "Low confidence. The qwen-vl-plus escalation pass did not improve the result — verify every amber field.";
       }
     } catch (error) {
-      attempts.push({
-        model: config.qwenEscalation,
-        status: "failed",
-        reason: errorMessage(error),
-      });
+      const reason = errorMessage(error);
+      failures.push(`${escalationModel}: ${reason}`);
+      attempts.push({ model: escalationModel, status: "failed", reason });
       warning =
-        "First pass confidence is low and the escalation pass failed. Please verify every amber field before saving.";
-      console.warn("[ocr] Qwen escalation failed:", errorMessage(error));
+        "Vision confidence is low and the qwen-vl-plus escalation pass failed. Verify every amber field before saving.";
+      console.warn(`[ocr] ${escalationModel} escalation failed:`, reason);
     }
+  } else if (firstPass.confidence_score < 0.75) {
+    warning =
+      "Vision confidence is low. Qwen escalation is unavailable; verify every amber field before saving.";
   }
 
-  return { data: final, mock: false, warning, attempts };
+  if (usedIndex > 0) {
+    warning =
+      warning ||
+      "A fallback vision model parsed this parchi. Review amber fields before saving.";
+  }
+
+  return {
+    data: final,
+    mock: false,
+    warning,
+    debugError: failures.length ? failures.join(" | ") : undefined,
+    attempts,
+  };
 }
 
 async function callEngine({
@@ -271,7 +309,7 @@ async function callEngine({
 
       const content = completion.choices?.[0]?.message?.content;
       if (typeof content !== "string" || !content.trim()) {
-        throw new Error("Empty OCR response.");
+        throw new Error("Empty vision response.");
       }
       return cleanJson(content);
     } finally {
@@ -283,8 +321,6 @@ async function callEngine({
     return await request(true);
   } catch (error) {
     if (supportsPlainJsonRetry(error)) {
-      // Some OpenAI-compatible providers reject response_format. The prompt
-      // itself already demands strict JSON, so retry once without that flag.
       return request(false);
     }
     throw error;
@@ -292,7 +328,11 @@ async function callEngine({
 }
 
 function supportsPlainJsonRetry(error: unknown) {
-  const candidate = error as { status?: number; message?: string; error?: { message?: string } };
+  const candidate = error as {
+    status?: number;
+    message?: string;
+    error?: { message?: string };
+  };
   const message = `${candidate?.message || ""} ${candidate?.error?.message || ""}`.toLowerCase();
   return (
     (candidate?.status === 400 || candidate?.status === 422) &&
@@ -313,7 +353,7 @@ function cleanJson(text: string): Record<string, unknown> {
     return parsed as Record<string, unknown>;
   } catch (error) {
     if (error instanceof Error && error.message.includes("JSON root")) throw error;
-    throw new Error("Invalid JSON returned by OCR provider.");
+    throw new Error("Invalid JSON returned by vision provider.");
   }
 }
 
@@ -345,6 +385,7 @@ function parseAndNormalize(
           product?.name ||
           `Scanned item ${index + 1}`,
         matched_product_id: product?.id || null,
+        matched: Boolean(product),
         size: normalizeText(item.size) || String(product?.attributes?.size || ""),
         gauge: normalizeText(item.gauge) || String(product?.attributes?.gauge || ""),
         grade: normalizeText(item.grade) || String(product?.attributes?.grade || ""),
@@ -383,6 +424,7 @@ function parseAndNormalize(
   const averageItemConfidence =
     items.reduce((sum, item) => sum + item.confidence, 0) / items.length;
   const confidence = clamp01(safeNumber(raw.confidence_score, averageItemConfidence));
+  const computedTotal = Math.round((subtotal + extraCharges) * 100) / 100;
 
   return {
     parchi_number: normalizeNullableText(raw.parchi_number),
@@ -394,8 +436,8 @@ function parseAndNormalize(
     extra_charges_label:
       normalizeText(raw.extra_charges_label) ||
       (kind === "purchase" ? "Freight / loading" : "Mazdoori / loading"),
-    total_amount: Math.round((subtotal + extraCharges) * 100) / 100,
-    scanned_total: modelTotal || Math.round((subtotal + extraCharges) * 100) / 100,
+    total_amount: computedTotal,
+    scanned_total: modelTotal || computedTotal,
     confidence_score: confidence,
     model_used: modelUsed,
     notes: normalizeText(raw.notes) || undefined,
@@ -406,15 +448,14 @@ function buildSystemPrompt(kind: ScanKind, products: Product[], parties: Party[]
   const productContext = products.map((product) => ({
     id: product.id,
     name: product.name,
-    sku: product.sku_code,
-    unit: product.unit,
+    sku_code: product.sku_code,
     size: product.attributes?.size,
     gauge: product.attributes?.gauge,
     grade: product.attributes?.grade,
     shape: product.attributes?.shape,
-    aliases: product.aliases,
+    unit: product.unit,
     sale_rate: product.sale_rate,
-    purchase_rate: product.purchase_rate,
+    aliases: product.aliases,
   }));
   const partyContext = parties
     .filter((party) => party.type !== "walk_in_cash")
@@ -430,20 +471,23 @@ DOCUMENT TYPE
 ${kindCopy[kind].label}
 ${kindCopy[kind].instruction}
 
+READING RULE — NON-NEGOTIABLE
+Read EVERY SINGLE handwritten line item from top to bottom on the parchi. Do NOT skip lines, do NOT merge different sizes/gauges, and do NOT invent items not written on the paper. If a line is crossed out, omit it. If a line is unclear, include your best reading with lower confidence.
+
 SHOP CONTEXT
-Existing catalogue: ${JSON.stringify(productContext)}
+Full product catalogue: ${JSON.stringify(productContext)}
 Known parties: ${JSON.stringify(partyContext)}
 
 HANDWRITING AND DOMAIN RULES
 1. Read mixed English, Roman Urdu and Pakistani hardware shorthand: "nali", "nalli", "pipe", "pcs", "length" mean quantity units. A standard pipe length is 20 ft.
 2. Sizes: 1/2", 3/4", 1", 1.25" ("sawa"), 1.5" ("dedh"), 2" ("do"), 2.5" ("dhai"), 3" ("teen"), 4" ("chaar").
-3. Grades are usually 201, 304 or 316. Gauges are 14G, 16G, 18G, 20G. Shape may be round/gol or square/chauras.
+3. Grades are usually 201, 304 or 316. Gauges are 14G, 16G, 18G, 20G. Shape may be round/gol or square/chauras. "1x2 chauras" means rectangular/square stock, not two separate lines.
 4. "mazdoori", "loading", "kiraya", "bhada", "freight", "labour" are EXTRA CHARGES, never product lines.
 5. "udhaar", "baqi", "khata", "credit", "likh lo", "baad mein" mean detected_routing = "customer_khata" and payment_mode = "udhaar".
 6. "cash", "naqad", "full payment", "paid" mean detected_routing = "cash_sale" and payment_mode = "cash".
-7. Match each line to the existing catalogue using size + gauge + grade + shape or aliases. Copy the exact catalogue id into matched_product_id. NEVER invent an id. If no confident match exists, use null and still fill size/gauge/grade/shape.
-8. Quantity and rate must be numbers. Rate is per nali/length unless the parchi explicitly shows kg. Compute amount = qty * rate.
-9. If a party is written, use the closest known party name exactly. Account for area labels such as "Nadeem - Sialkot Rd". If no party is written, party_name must be null and routing must be cash_sale.
+7. Match each line to the catalogue using size + gauge + grade + shape, the product name, SKU or its aliases. Copy the exact catalogue id into matched_product_id. NEVER invent an id. If no confident match exists, use null, set matched=false, and still fill size/gauge/grade/shape.
+8. Quantities and rates must be numbers. Rate is per nali/length unless the parchi explicitly shows kg. Compute amount = qty * rate.
+9. If a party is written, use the closest known party name exactly, accounting for area labels such as "Nadeem - Sialkot Rd". If no party is written, party_name must be null and routing must be cash_sale.
 10. parchi_number must be a string exactly as written, or null when absent.
 11. confidence_score and each item's confidence must be between 0 and 1. Be honest: lower confidence for ambiguous handwriting, missing rates or unclear grades.
 12. Do not include markdown, commentary or code fences.
@@ -457,6 +501,7 @@ RETURN STRICT JSON WITH THIS SHAPE
   "items": [
     {
       "matched_product_id": string | null,
+      "matched": boolean,
       "raw_scanned_name": string,
       "size": string,
       "gauge": string,
@@ -476,11 +521,11 @@ RETURN STRICT JSON WITH THIS SHAPE
 }`;
 }
 
-function buildUserPrompt(kind: ScanKind, imageDataUrl: string) {
+function buildUserPrompt(kind: ScanKind) {
   return `Parse the attached ${kindCopy[kind].label} photo. Today in Pakistan: ${new Intl.DateTimeFormat(
     "en-PK",
     { dateStyle: "medium", timeZone: "Asia/Karachi" },
-  ).format(new Date())}. Image MIME prefix: ${imageDataUrl.slice(0, 32)}. Return the complete strict JSON object now.`;
+  ).format(new Date())}. Count every handwritten line first, then return that many item objects in the same order. Return the complete strict JSON object now.`;
 }
 
 export function buildMockExtraction(
@@ -565,13 +610,13 @@ export function buildMockExtraction(
     paymentMode = "udhaar";
   }
 
-  const subtotal = items.reduce((sum, item) => sum + item.amount, 0);
-  const total = Math.round((subtotal + extraCharges) * 100) / 100;
-
   if (!chosenParty) {
     route = "cash_sale";
     paymentMode = "cash";
   }
+
+  const subtotal = items.reduce((sum, item) => sum + item.amount, 0);
+  const total = Math.round((subtotal + extraCharges) * 100) / 100;
 
   return {
     parchi_number: parchi,
@@ -585,7 +630,7 @@ export function buildMockExtraction(
     scanned_total: total,
     confidence_score: kind === "sale" ? 0.9 : 0.88,
     model_used: MOCK_MODEL,
-    notes: "Realistic demo parse. Configure QWEN_API_KEY or GLM_API_KEY for live OCR.",
+    notes: "Mock fallback. Configure GLM_API_KEY or QWEN_API_KEY for real vision OCR.",
   };
 }
 
@@ -599,6 +644,7 @@ function makeMockItem(
     id: `scan_${Math.random().toString(36).slice(2, 10)}`,
     raw_scanned_name: product?.name || "Pipe item",
     matched_product_id: product?.id || null,
+    matched: Boolean(product),
     size: String(product?.attributes?.size || ""),
     gauge: String(product?.attributes?.gauge || ""),
     grade: String(product?.attributes?.grade || ""),
@@ -624,6 +670,7 @@ function findProduct(raw: Record<string, unknown>, products: Product[]) {
   const rawName = (
     normalizeText(raw.raw_scanned_name) || normalizeText(raw.raw_name)
   ).toLowerCase();
+  const normalizedRawName = rawName.replace(/[^a-z0-9]+/g, " ").trim();
 
   const scored = products
     .map((product) => {
@@ -642,10 +689,15 @@ function findProduct(raw: Record<string, unknown>, products: Product[]) {
       if (gauge && pGauge === gauge) score += 3;
       if (grade && pGrade === grade) score += 3;
       if (shape && (pShape === shape || pShape.includes(shape))) score += 1;
-      const aliasHit = (product.aliases || []).some((alias) =>
-        rawName.includes(alias.toLowerCase()),
-      );
-      if (aliasHit) score += 3;
+      const aliasHit = (product.aliases || []).some((alias) => {
+        const normalizedAlias = alias.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+        return (
+          normalizedAlias.length > 2 &&
+          (normalizedRawName === normalizedAlias ||
+            normalizedRawName.includes(normalizedAlias))
+        );
+      });
+      if (aliasHit) score += 8;
       const baseName = product.name.toLowerCase().split("—")[0].trim();
       if (baseName && rawName.includes(baseName)) score += 2;
       return { product, score };
@@ -676,8 +728,18 @@ function clamp01(value: number) {
 }
 
 function errorMessage(error: unknown) {
-  if (error instanceof Error) return error.message.slice(0, 300);
-  return "Unknown OCR error.";
+  let message = error instanceof Error ? error.message : "Unknown vision API error.";
+  message = message
+    .replace(/sk-[A-Za-z0-9._-]+/g, "[redacted]")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]");
+  for (const secret of [
+    process.env.GLM_API_KEY,
+    process.env.QWEN_API_KEY,
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+  ]) {
+    if (secret && secret.length >= 8) {
+      message = message.split(secret).join("[redacted]");
+    }
+  }
+  return message.replace(/\s+/g, " ").trim().slice(0, 500) || "Unknown vision API error.";
 }
-
-

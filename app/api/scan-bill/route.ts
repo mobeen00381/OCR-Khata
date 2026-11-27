@@ -66,9 +66,14 @@ export async function POST(request: Request) {
       mock: result.mock,
       warning: result.warning,
       model_used: result.data.model_used,
+      debug_error: result.debugError,
     });
   } catch (error) {
     console.error("[scan-bill] OCR pipeline error:", error);
+    const debugError =
+      error instanceof Error
+        ? error.message.replace(/sk-[A-Za-z0-9._-]+/g, "[redacted]").slice(0, 500)
+        : "Unknown pipeline error.";
     return NextResponse.json({
       success: true,
       data: buildMockExtraction(kind, products, parties),
@@ -76,6 +81,7 @@ export async function POST(request: Request) {
       warning:
         "OCR pipeline error. A realistic demo parse is shown so the scanner remains usable.",
       model_used: "mock-fallback",
+      debug_error: debugError,
     });
   }
 }

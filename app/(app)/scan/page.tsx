@@ -238,6 +238,7 @@ export default function ScanPage() {
           extraction: payload.data,
           mock: Boolean(payload.mock),
           warning: payload.warning,
+          debugError: payload.debug_error,
           error: undefined,
         };
       } catch (error) {
@@ -281,7 +282,7 @@ export default function ScanPage() {
     );
   }
 
-  function handleConfirm(input: NewTransactionInput) {
+  async function handleConfirm(input: NewTransactionInput) {
     if (locked) {
       toast({
         title: "Day locked hai",
@@ -292,7 +293,7 @@ export default function ScanPage() {
     }
 
     try {
-      const { transaction } = saveTransaction(input);
+      const { transaction, warning } = await saveTransaction(input);
       const party = state.parties.find((entry) => entry.id === input.party_id);
       const savedEntry: SavedEntry = {
         id: transaction.id,
@@ -315,8 +316,16 @@ export default function ScanPage() {
             : transaction.type === "purchase"
               ? "Purchase stock mein add ho gaya"
               : "Wapsi entry save ho gayi",
-        description: `${savedEntry.partyName} · ${formatPKR(transaction.total_amount)} · stock updated.`,
+        description: `${savedEntry.partyName} · ${formatPKR(transaction.total_amount)} · stock and handwriting alias updated.`,
       });
+      if (warning) {
+        toast({
+          title: "Bill image upload warning",
+          description: warning,
+          tone: "info",
+          duration: 6000,
+        });
+      }
 
       const candidates = drafts
         .map((draft, index) =>
@@ -334,6 +343,7 @@ export default function ScanPage() {
         title: "Save nahi hua",
         description: error instanceof Error ? error.message : "Dobara try karein.",
         tone: "error",
+        duration: 7000,
       });
     }
   }
@@ -362,7 +372,7 @@ export default function ScanPage() {
     }
     if (stage === "scanning") {
       return {
-        eyebrow: "Dual OCR · Reading",
+        eyebrow: "Vision OCR · Reading",
         title: (
           <>
             Parchi padhi ja rahi hai
@@ -591,7 +601,7 @@ function ScanningStage({
 
         <div className="mt-4 flex items-center gap-2 text-[9px] font-medium text-slate-400">
           <ShieldCheck className="h-3 w-3" />
-          Qwen 3.8 Flash + GLM 5.3 fallback · secure server route
+          glm-4.6v → glm-4.6v-flash → qwen-vl-plus · secure server route
         </div>
       </Card>
     </div>

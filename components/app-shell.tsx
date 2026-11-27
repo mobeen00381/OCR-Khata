@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
@@ -7,15 +8,22 @@ import {
   Boxes,
   Camera,
   ChevronRight,
+  Cloud,
+  CloudOff,
+  Database,
   FileBarChart2,
   LayoutDashboard,
+  Loader2,
   NotebookTabs,
+  RefreshCw,
   ScanLine,
   ShieldCheck,
+  X,
 } from "lucide-react";
 import { motion } from "framer-motion";
 import { cn, initials } from "@/lib/utils";
 import { useStore } from "@/lib/store";
+import { useToast } from "./toast";
 import { BrandMark, Wordmark } from "./brand-mark";
 
 const navItems = [
@@ -64,11 +72,148 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
           className="mx-auto w-full max-w-[1420px] px-4 pb-nav pt-5 sm:px-6 md:px-8 md:pb-10 md:pt-8 lg:px-10"
         >
+          <CloudStatusBanner />
           {children}
         </motion.main>
       </div>
     </div>
   );
+}
+
+function CloudStatusBanner() {
+  const {
+    dataMode,
+    remoteEmpty,
+    remoteError,
+    syncWarning,
+    seedRemoteDemo,
+    reloadRemote,
+    clearSyncWarning,
+  } = useStore();
+  const { toast } = useToast();
+  const [loading, setLoading] = useState<"seed" | "retry" | null>(null);
+
+  async function seed() {
+    setLoading("seed");
+    try {
+      await seedRemoteDemo();
+      toast({
+        title: "Demo shop loaded into Supabase",
+        description: "Stock, khatay, bills and payments are now cloud-persisted.",
+      });
+    } catch (error) {
+      toast({
+        title: "Demo data load nahi hui",
+        description: error instanceof Error ? error.message : "Check Supabase schema.",
+        tone: "error",
+        duration: 7000,
+      });
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  async function retry() {
+    setLoading("retry");
+    try {
+      await reloadRemote();
+      toast({ title: "Cloud workspace refreshed" });
+    } catch (error) {
+      toast({
+        title: "Cloud refresh failed",
+        description: error instanceof Error ? error.message : "Still unavailable.",
+        tone: "error",
+      });
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  if (remoteEmpty) {
+    return (
+      <div className="mb-5 flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3.5 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-start gap-2.5">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white text-amber-700 shadow-sm">
+            <Database className="h-4 w-4" />
+          </span>
+          <div>
+            <p className="text-[11.5px] font-bold text-amber-900">
+              Supabase connected · shop database is empty
+            </p>
+            <p className="mt-0.5 text-[9.5px] leading-relaxed text-amber-700">
+              Load the Pakistani steel-store demo to start testing with persistent products,
+              khatay and transactions.
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => void seed()}
+          disabled={Boolean(loading)}
+          className="inline-flex min-h-[38px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-amber-600 px-3 text-[10px] font-bold text-white transition hover:bg-amber-700 disabled:opacity-60"
+        >
+          {loading === "seed" ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Database className="h-3.5 w-3.5" />
+          )}
+          {loading === "seed" ? "Loading demo…" : "Load Demo Shop Data"}
+        </button>
+      </div>
+    );
+  }
+
+  if (remoteError) {
+    return (
+      <div className="mb-5 flex flex-col gap-3 rounded-xl border border-red-200 bg-red-50 p-3.5 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex items-start gap-2.5">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white text-crimson shadow-sm">
+            <CloudOff className="h-4 w-4" />
+          </span>
+          <div>
+            <p className="text-[11.5px] font-bold text-crimson">
+              {dataMode === "local" ? "Cloud unavailable · local cache active" : "Supabase sync error"}
+            </p>
+            <p className="mt-0.5 max-h-16 overflow-y-auto break-words text-[9px] leading-relaxed text-red-700">
+              {remoteError}
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => void retry()}
+          disabled={Boolean(loading)}
+          className="inline-flex min-h-[38px] shrink-0 items-center justify-center gap-1.5 rounded-lg border border-red-200 bg-white px-3 text-[10px] font-bold text-crimson transition hover:bg-red-50 disabled:opacity-60"
+        >
+          {loading === "retry" ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3.5 w-3.5" />
+          )}
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  if (syncWarning) {
+    return (
+      <div className="mb-5 flex items-center gap-2.5 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5">
+        <Cloud className="h-4 w-4 shrink-0 text-amber-700" />
+        <p className="flex-1 text-[10px] leading-relaxed text-amber-800">{syncWarning}</p>
+        <button
+          type="button"
+          onClick={clearSyncWarning}
+          className="flex h-7 w-7 items-center justify-center rounded-md text-amber-700 hover:bg-amber-100"
+          aria-label="Dismiss cloud warning"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+    );
+  }
+
+  return null;
 }
 
 function BootSplash() {
@@ -104,7 +249,7 @@ function DesktopSidebar({  pathname,
   pathname: string;
   lowStockCount: number;
 }) {
-  const { state } = useStore();
+  const { state, dataMode } = useStore();
   const business = state.business;
 
   return (
@@ -238,9 +383,15 @@ function DesktopSidebar({  pathname,
           </span>
           <div className="min-w-0 flex-1">
             <p className="truncate text-[11px] font-bold text-ink">Malik Sahib</p>
-            <p className="text-[9.5px] font-medium text-ink-mute">Owner · Phase 1</p>
+            <p className="text-[9.5px] font-medium text-ink-mute">
+              {dataMode === "supabase" ? "Owner · Supabase live" : "Owner · Local demo"}
+            </p>
           </div>
-          <ShieldCheck className="h-4 w-4 text-emerald-600" />
+          {dataMode === "supabase" ? (
+            <Cloud className="h-4 w-4 text-emerald-600" />
+          ) : (
+            <ShieldCheck className="h-4 w-4 text-slate-400" />
+          )}
         </div>
       </div>
     </aside>

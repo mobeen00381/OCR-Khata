@@ -380,8 +380,8 @@ create policy "day_closures_owner_all"
 -- ═══════════════════════════════════════════════════════════════════════════
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values (
-  'parchi-images',
-  'parchi-images',
+  'bill-images',
+  'bill-images',
   false,
   10485760,
   array['image/jpeg', 'image/png', 'image/webp']
@@ -391,52 +391,261 @@ on conflict (id) do update
       file_size_limit = excluded.file_size_limit,
       allowed_mime_types = excluded.allowed_mime_types;
 
-drop policy if exists "steelkhata_parchi_read" on storage.objects;
-create policy "steelkhata_parchi_read"
+drop policy if exists "steelkhata_bill_read" on storage.objects;
+create policy "steelkhata_bill_read"
   on storage.objects
   for select
   to authenticated
   using (
-    bucket_id = 'parchi-images'
+    bucket_id = 'bill-images'
     and public.owns_business(((storage.foldername(name))[1])::uuid)
   );
 
-drop policy if exists "steelkhata_parchi_insert" on storage.objects;
-create policy "steelkhata_parchi_insert"
+drop policy if exists "steelkhata_bill_insert" on storage.objects;
+create policy "steelkhata_bill_insert"
   on storage.objects
   for insert
   to authenticated
   with check (
-    bucket_id = 'parchi-images'
+    bucket_id = 'bill-images'
     and public.owns_business(((storage.foldername(name))[1])::uuid)
   );
 
-drop policy if exists "steelkhata_parchi_update" on storage.objects;
-create policy "steelkhata_parchi_update"
+drop policy if exists "steelkhata_bill_update" on storage.objects;
+create policy "steelkhata_bill_update"
   on storage.objects
   for update
   to authenticated
   using (
-    bucket_id = 'parchi-images'
+    bucket_id = 'bill-images'
     and public.owns_business(((storage.foldername(name))[1])::uuid)
   )
   with check (
-    bucket_id = 'parchi-images'
+    bucket_id = 'bill-images'
     and public.owns_business(((storage.foldername(name))[1])::uuid)
   );
 
-drop policy if exists "steelkhata_parchi_delete" on storage.objects;
-create policy "steelkhata_parchi_delete"
+drop policy if exists "steelkhata_bill_delete" on storage.objects;
+create policy "steelkhata_bill_delete"
   on storage.objects
   for delete
   to authenticated
   using (
-    bucket_id = 'parchi-images'
+    bucket_id = 'bill-images'
     and public.owns_business(((storage.foldername(name))[1])::uuid)
   );
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- 10. DEMO SEED — Malik Steel Pipe Store, Lahore
+-- 10. ATOMIC WRITE FUNCTIONS (called by the server-side workspace API)
+--     These keep transaction rows, stock, khata balances and learned aliases in
+--     one PostgreSQL transaction. Execute is restricted to service_role.
+-- ═══════════════════════════════════════════════════════════════════════════
+create or replace function public.record_scan_transaction(
+  p_business_id uuid,
+  p_party_id uuid,
+  p_parchi_number text,
+  p_type text,
+  p_routing_mode text,
+  p_payment_mode text,
+  p_subtotal numeric,
+  p_extra_charges numeric,
+  p_total_amount numeric,
+  p_paid_amount numeric,
+  p_bill_image_url text,
+  p_created_at timestamptz,
+  p_notes text,
+  p_items jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_tx uuid;
+  v_created_at timestamptz := coalesce(p_created_at, now());
+  v_item jsonb;
+  v_product_id uuid;
+  v_raw_name text;
+  v_qty numeric;
+  v_rate numeric;
+  v_amount numeric;
+  v_unit text;
+  v_alias text;
+  v_aliases text[];
+begin
+  if not exists (select 1 from public.businesses where id = p_business_id) then
+    raise exception 'Unknown business %', p_business_id;
+  end if;
+  if p_type not in ('sale', 'purchase', 'sale_return') then
+    raise exception 'Invalid transaction type %', p_type;
+  end if;
+  if p_routing_mode not in ('cash_sale', 'customer_khata') then
+    raise exception 'Invalid routing mode %', p_routing_mode;
+  end if;
+  if p_payment_mode not in ('cash', 'udhaar', 'bank') then
+    raise exception 'Invalid payment mode %', p_payment_mode;
+  end if;
+  if p_items is null or jsonb_array_length(p_items) = 0 then
+    raise exception 'A transaction needs at least one line item';
+  end if;
+  if exists (
+    select 1 from public.day_closures
+     where business_id = p_business_id
+       and closing_date = v_created_at::date
+  ) then
+    raise exception 'Day is locked for %', v_created_at::date;
+  end if;
+
+  insert into public.transactions
+    (business_id, party_id, parchi_number, type, routing_mode, payment_mode,
+     subtotal, extra_charges, total_amount, paid_amount, bill_image_url,
+     is_day_locked, created_at, notes)
+  values
+    (p_business_id, p_party_id, p_parchi_number, p_type, p_routing_mode, p_payment_mode,
+     greatest(coalesce(p_subtotal, 0), 0), greatest(coalesce(p_extra_charges, 0), 0),
+     greatest(coalesce(p_total_amount, 0), 0), greatest(coalesce(p_paid_amount, 0), 0),
+     p_bill_image_url, false, v_created_at, p_notes)
+  returning id into v_tx;
+
+  for v_item in select * from jsonb_array_elements(p_items)
+  loop
+    v_product_id := nullif(v_item ->> 'product_id', '')::uuid;
+    v_raw_name := coalesce(v_item ->> 'raw_scanned_name', '');
+    v_qty := greatest(coalesce((v_item ->> 'quantity')::numeric, 0), 0);
+    v_rate := greatest(coalesce((v_item ->> 'rate')::numeric, 0), 0);
+    v_amount := greatest(coalesce((v_item ->> 'amount')::numeric, v_qty * v_rate), 0);
+    v_unit := coalesce(nullif(v_item ->> 'unit', ''), 'length');
+
+    if v_product_id is null or v_qty <= 0 then
+      raise exception 'Invalid line item: product_id and quantity are required';
+    end if;
+    if v_unit not in ('length', 'kg', 'pcs') then
+      v_unit := 'length';
+    end if;
+
+    insert into public.transaction_items
+      (business_id, transaction_id, product_id, raw_scanned_name, quantity, unit, rate, amount)
+    values
+      (p_business_id, v_tx, v_product_id, v_raw_name, v_qty, v_unit, v_rate, v_amount);
+
+    if p_type = 'sale' then
+      update public.products
+         set current_stock = greatest(current_stock - v_qty, 0),
+             last_sold_at = v_created_at
+       where id = v_product_id and business_id = p_business_id;
+    else
+      update public.products
+         set current_stock = current_stock + v_qty
+       where id = v_product_id and business_id = p_business_id;
+    end if;
+
+    if not found then
+      raise exception 'Product % does not belong to this business', v_product_id;
+    end if;
+
+    -- Self-learning alias: remember the exact handwritten string for the
+    -- matched product, case-insensitively and deduplicated.
+    select coalesce(aliases, '{}'::text[]) into v_aliases
+      from public.products
+     where id = v_product_id and business_id = p_business_id;
+
+    v_alias := regexp_replace(lower(btrim(coalesce(v_raw_name, ''))), '\s+', ' ', 'g');
+    if v_alias <> '' and not exists (
+      select 1 from unnest(v_aliases) as existing(alias)
+       where lower(btrim(existing.alias)) = v_alias
+    ) then
+      update public.products
+         set aliases = array_append(coalesce(v_aliases, '{}'::text[]), v_alias)
+       where id = v_product_id and business_id = p_business_id;
+    end if;
+  end loop;
+
+  if p_routing_mode = 'customer_khata' then
+    if p_type = 'sale' then
+      update public.parties
+         set current_balance = current_balance + greatest(coalesce(p_total_amount, 0), 0)
+       where id = p_party_id and business_id = p_business_id;
+    elsif p_type = 'sale_return' then
+      update public.parties
+         set current_balance = current_balance - greatest(coalesce(p_total_amount, 0), 0)
+       where id = p_party_id and business_id = p_business_id;
+    end if;
+  end if;
+
+  return v_tx;
+end;
+$$;
+
+revoke all on function public.record_scan_transaction(
+  uuid, uuid, text, text, text, text, numeric, numeric, numeric, numeric, text, timestamptz, text, jsonb
+) from public;
+grant execute on function public.record_scan_transaction(
+  uuid, uuid, text, text, text, text, numeric, numeric, numeric, numeric, text, timestamptz, text, jsonb
+) to service_role;
+
+create or replace function public.record_payment_entry(
+  p_business_id uuid,
+  p_party_id uuid,
+  p_entry_type text,
+  p_description text,
+  p_amount numeric,
+  p_payment_mode text,
+  p_created_at timestamptz
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_id uuid;
+  v_created_at timestamptz := coalesce(p_created_at, now());
+begin
+  if p_entry_type not in ('customer_wasooli', 'supplier_payment', 'shop_expense') then
+    raise exception 'Invalid payment entry type';
+  end if;
+  if coalesce(p_amount, 0) <= 0 then
+    raise exception 'Payment amount must be positive';
+  end if;
+  if exists (
+    select 1 from public.day_closures
+     where business_id = p_business_id
+       and closing_date = v_created_at::date
+  ) then
+    raise exception 'Day is locked for %', v_created_at::date;
+  end if;
+
+  insert into public.payments_and_expenses
+    (business_id, party_id, entry_type, description, amount, payment_mode, created_at)
+  values
+    (p_business_id, p_party_id, p_entry_type, p_description, p_amount,
+     coalesce(p_payment_mode, 'cash'), v_created_at)
+  returning id into v_id;
+
+  if p_party_id is not null and p_entry_type = 'customer_wasooli' then
+    update public.parties
+       set current_balance = current_balance - p_amount
+     where id = p_party_id and business_id = p_business_id;
+  elsif p_party_id is not null and p_entry_type = 'supplier_payment' then
+    update public.parties
+       set current_balance = current_balance + p_amount
+     where id = p_party_id and business_id = p_business_id;
+  end if;
+
+  return v_id;
+end;
+$$;
+
+revoke all on function public.record_payment_entry(
+  uuid, uuid, text, text, numeric, text, timestamptz
+) from public;
+grant execute on function public.record_payment_entry(
+  uuid, uuid, text, text, numeric, text, timestamptz
+) to service_role;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 11. DEMO SEED — Malik Steel Pipe Store, Lahore
 --     Attaches to the oldest auth user. Skips cleanly if no user exists.
 -- ═══════════════════════════════════════════════════════════════════════════
 do $seed$
